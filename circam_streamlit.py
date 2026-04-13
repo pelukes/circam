@@ -2,9 +2,46 @@ import streamlit as st
 import cv2
 import numpy as np
 import io
-from PIL import Image
+from PIL import Image, ExifTags
 
 st.set_page_config(page_title="iPhone CIR Generator", layout="centered")
+
+# --- FUNKCE PRO OPRAVU ORIENTACE PODLE EXIF ---
+def fix_image_orientation(img):
+    """
+    Přečte EXIF data z PIL Image a otočí/překlopí obraz 
+    podle 'Orientation' tagu, aby odpovídal realitě.
+    """
+    try:
+        # Najdeme ID pro 'Orientation' tag
+        for orientation_id in ExifTags.TAGS.keys():
+            if ExifTags.TAGS[orientation_id] == 'Orientation':
+                break
+        else:
+            return img # Nenalezeno, vracíme původní
+
+        exif = img._getexif()
+        if exif is None:
+            return img # Bez EXIFu, vracíme původní
+
+        orientation = exif.get(orientation_id)
+        if orientation is None:
+            return img # Bez Orientation tagu, vracíme původní
+
+        # Aplikace transformací podle standardu EXIF
+        if orientation == 2:   img = img.transpose(Image.FLIP_LEFT_RIGHT)
+        elif orientation == 3: img = img.rotate(180, expand=True)
+        elif orientation == 4: img = img.rotate(180, expand=True).transpose(Image.FLIP_LEFT_RIGHT)
+        elif orientation == 5: img = img.rotate(-90, expand=True).transpose(Image.FLIP_LEFT_RIGHT)
+        elif orientation == 6: img = img.rotate(-90, expand=True) # Klasické otočení doprava
+        elif orientation == 7: img = img.rotate(90, expand=True).transpose(Image.FLIP_LEFT_RIGHT)
+        elif orientation == 8: img = img.rotate(90, expand=True)  # Klasické otočení doleva
+
+    except Exception as e:
+        print(f"Varování: Chyba při čtení EXIFu ({e})")
+        # Při chybě raději vrátíme původní obrázek, než abychom aplikaci shodili
+    
+    return img
 
 def process_cir(rgb_img, ir_img):
     # Převod z PIL (Streamlit default) na OpenCV (BGR)
@@ -48,9 +85,12 @@ def process_cir(rgb_img, ir_img):
     out_w, out_h = int(w * out_scale), int(h * out_scale)
 
     # Přepočet matice pro nové rozlišení
-    S_work_inv = np.diag([1/work_scale, 1/work_scale, 1])
-    S_out = np.diag([out_scale, out_scale, 1])
-    M_final = S_out @ S_work_inv @ M @ S_work_inv
+    ratio = out_scale / work_scale
+    M_final = np.array([
+        [M[0,0], M[0,1], M[0,2] * ratio],
+        [M[1,0], M[1,1], M[1,2] * ratio],
+        [M[2,0] / ratio, M[2,1] / ratio, M[2,2]]
+    ])
 
     img_rgb_res = cv2.resize(img_rgb, (out_w, out_h))
     img_ir_res = cv2.resize(img_ir, (out_w, out_h))
@@ -70,22 +110,30 @@ def process_cir(rgb_img, ir_img):
     return cv2.cvtColor(cir_composite, cv2.COLOR_BGR2RGB), None
 
 # --- UI STRÁNKY ---
-st.title("🛰️ iPhone CIR Generator")
-st.write("Vytvořte Color-InfraRed kompozit ze dvou fotografií.")
+st.title("🛰️ iPhone CIR Generator (Vylepšený)")
+st.write("Vytvořte Color-InfraRed kompozit (RED=NIR) ze dvou fotografií.")
+
+# Přepínač pro zapnutí/vypnutí opravy orientace (pro jistotu)
+use_exif_fix = st.checkbox("Opravit orientaci fotek (pro iPhone)", value=True)
 
 col1, col2 = st.columns(2)
 with col1:
-    rgb_file = st.file_uploader("1. Standardní RGB (s filtrem)", type=['jpg', 'jpeg', 'png', 'dng'])
+    rgb_file = st.file_uploader("1. Standardní RGB (s filtrem)", type=['jpg', 'jpeg', 'png'])
 with col2:
-    ir_file = st.file_uploader("2. IR snímek (bez filtru)", type=['jpg', 'jpeg', 'png', 'dng'])
+    ir_file = st.file_uploader("2. IR snímek (bez filtru)", type=['jpg', 'jpeg', 'png'])
 
 if rgb_file and ir_file:
     if st.button("GENEROVAT CIR KOMPOZIT"):
-        with st.spinner("Probíhá registrace obrazu a skládání kanálů..."):
+        with st.spinner("Probíhá načítání, oprava orientace, registrace a skládání kanálů..."):
             try:
                 # Načtení do PIL
                 img_rgb = Image.open(rgb_file)
                 img_ir = Image.open(ir_file)
+                
+                # --- APLIKACE OPRAVY ORIENTACE ---
+                if use_exif_fix:
+                    img_rgb = fix_image_orientation(img_rgb)
+                    img_ir = fix_image_orientation(img_ir)
                 
                 # Zpracování
                 result, error = process_cir(img_rgb, img_ir)
@@ -94,21 +142,23 @@ if rgb_file and ir_file:
                     st.error(error)
                 else:
                     st.success("Hotovo!")
-                    st.image(result, caption="Výsledný CIR kompozit (RED=NIR)", use_container_width=True)
+                    st.image(result, caption="Výsledný CIR kompozit", use_container_width=True)
                     
-                    # Příprava ke stažení
+                    # Příprava ke stažení (v plné kvalitě)
                     result_pil = Image.fromarray(result)
                     buf = io.BytesIO()
-                    result_pil.save(buf, format="JPEG", quality=90)
+                    result_pil.save(buf, format="JPEG", quality=92)
                     byte_im = buf.getvalue()
                     
                     st.download_button(
                         label="Stáhnout výsledek",
                         data=byte_im,
-                        file_name="cir_composite.jpg",
+                        file_name="cir_result.jpg",
                         mime="image/jpeg"
                     )
             except Exception as e:
-                st.error(f"Došlo k chybě: {e}")
+                st.error(f"Došlo k chybě při zpracování: {e}")
+                import traceback
+                st.code(traceback.format_exc()) # Pro debugging na cloudu
 else:
-    st.info("Nahrajte oba soubory pro spuštění zpracování.")
+    st.info("Nahrajte oba soubory (jeden s filtrem a druhý bez) pro spuštění.")
